@@ -1,0 +1,8 @@
+# Every change needs review. Terraform and pipeline changes need the security
+# owner specifically. Enable "Require review from Code Owners" in branch
+# protection for this file to have any effect.
+
+*                       @rgardner21
+/terraform/             @rgardner21
+/.github/workflows/     @rgardner21
+/k8s/                   @rgardner21

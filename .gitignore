@@ -1,0 +1,12 @@
+node_modules/
+npm-debug.log*
+.env
+.DS_Store
+*.tfstate
+*.tfstate.*
+.terraform/
+backend.hcl
+terraform.tfvars
+*.tfplan
+*.sarif
+kubeconfig

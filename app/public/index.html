@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wiz-todo</title>
+<style>
+  :root {
+    --ink: #16211f;
+    --paper: #eef1ec;
+    --panel: #ffffff;
+    --rule: #c9d1c9;
+    --accent: #0f5c4a;
+    --warn: #8a4b12;
+    --muted: #5d6b66;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.55 ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+    padding: 32px 20px 64px;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 {
+    font-size: 13px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    font-weight: 600;
+    margin: 0 0 4px;
+    color: var(--muted);
+  }
+  .lede { margin: 0 0 24px; font-size: 22px; letter-spacing: -0.01em; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+  }
+  /* Signature element: live proof panel for the exercise checks. */
+  .checks { padding: 14px 16px; margin-bottom: 24px; }
+  .checks dl { display: grid; grid-template-columns: 168px 1fr; gap: 6px 16px; margin: 0; }
+  .checks dt { color: var(--muted); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .checks dd { margin: 0; word-break: break-all; }
+  .ok::before { content: "● "; color: var(--accent); }
+  .bad::before { content: "● "; color: var(--warn); }
+  form { display: flex; gap: 8px; margin-bottom: 16px; }
+  input[type=text] {
+    flex: 1; padding: 10px 12px; font: inherit;
+    border: 1px solid var(--rule); border-radius: 2px; background: var(--panel);
+  }
+  input[type=text]:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    font: inherit; padding: 10px 16px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 2px;
+  }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--rule); }
+  li:last-child { border-bottom: 0; }
+  li.done span { text-decoration: line-through; color: var(--muted); }
+  li span { flex: 1; }
+  .del { background: none; border: 0; color: var(--muted); padding: 4px 8px; }
+  .del:hover { color: var(--warn); }
+  .empty { padding: 24px 16px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Wiz exercise · Kubernetes workload</h1>
+  <p class="lede">Tasks, stored in the self-managed MongoDB VM.</p>
+
+  <section class="panel checks" aria-live="polite">
+    <dl>
+      <dt>wizexercise.txt</dt><dd id="c-file">checking…</dd>
+      <dt>MongoDB</dt><dd id="c-db">checking…</dd>
+      <dt>Server version</dt><dd id="c-ver">—</dd>
+      <dt>Connection string</dt><dd id="c-uri">—</dd>
+      <dt>Pod</dt><dd id="c-pod">—</dd>
+    </dl>
+  </section>
+
+  <form id="add">
+    <input type="text" id="title" placeholder="What needs doing?" autocomplete="off" maxlength="280">
+    <button type="submit">Add task</button>
+  </form>
+
+  <section class="panel"><ul id="list"><li class="empty">Loading tasks…</li></ul></section>
+</main>
+
+<script>
+const list = document.getElementById('list');
+
+async function loadStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    const file = document.getElementById('c-file');
+    file.textContent = s.wizexerciseFile ? s.wizexerciseContents : 'not found in image';
+    file.className = s.wizexerciseFile ? 'ok' : 'bad';
+
+    const db = document.getElementById('c-db');
+    db.textContent = s.database;
+    db.className = s.database === 'connected' ? 'ok' : 'bad';
+
+    document.getElementById('c-ver').textContent = s.databaseVersion || '—';
+    document.getElementById('c-uri').textContent = s.databaseHost || '—';
+    document.getElementById('c-pod').textContent = s.pod || '—';
+  } catch (e) {
+    document.getElementById('c-db').textContent = 'status endpoint unreachable';
+  }
+}
+
+async function loadTodos() {
+  const res = await fetch('/api/todos');
+  if (!res.ok) {
+    list.innerHTML = '<li class="empty">The database is not reachable yet. Retrying happens automatically.</li>';
+    return;
+  }
+  const todos = await res.json();
+  if (!todos.length) {
+    list.innerHTML = '<li class="empty">No tasks yet. Add the first one above.</li>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const t of todos) {
+    const li = document.createElement('li');
+    li.className = t.done ? 'done' : '';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = t.done;
+    box.addEventListener('change', async () => {
+      await fetch('/api/todos/' + t._id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ done: box.checked })
+      });
+      loadTodos();
+    });
+    const span = document.createElement('span');
+    span.textContent = t.title;
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = 'Delete';
+    del.addEventListener('click', async () => {
+      await fetch('/api/todos/' + t._id, { method: 'DELETE' });
+      loadTodos();
+    });
+    li.append(box, span, del);
+    list.append(li);
+  }
+}
+
+document.getElementById('add').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('title');
+  const title = input.value.trim();
+  if (!title) return;
+  await fetch('/api/todos', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title })
+  });
+  input.value = '';
+  loadTodos();
+});
+
+loadStatus();
+loadTodos();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

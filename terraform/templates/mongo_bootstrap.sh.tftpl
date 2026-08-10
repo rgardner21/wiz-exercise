@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Bootstrap for the intentionally outdated MongoDB VM.
+set -euxo pipefail
+exec > >(tee /var/log/wiz-bootstrap.log | logger -t wiz-bootstrap -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y gnupg curl wget awscli cron
+
+###############################################################################
+# Install MongoDB ${mongo_version} on Ubuntu ${ubuntu_release} (both deliberately outdated)
+###############################################################################
+wget -qO - https://www.mongodb.org/static/pgp/server-${mongo_version}.asc | apt-key add -
+
+echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu ${ubuntu_release}/mongodb-org/${mongo_version} multiverse" \
+  > /etc/apt/sources.list.d/mongodb-org-${mongo_version}.list
+
+apt-get update -y
+apt-get install -y mongodb-org
+
+# Pin so unattended upgrades cannot quietly modernise the exercise finding.
+apt-mark hold mongodb-org mongodb-org-server mongodb-org-shell mongodb-org-mongos mongodb-org-tools || true
+
+###############################################################################
+# Listen on all interfaces so EKS pods can connect (the security group is what
+# restricts access to Kubernetes worker nodes).
+###############################################################################
+cat > /etc/mongod.conf <<'MONGOCONF'
+storage:
+  dbPath: /var/lib/mongodb
+  journal:
+    enabled: true
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+net:
+  port: 27017
+  bindIp: 0.0.0.0
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+MONGOCONF
+
+systemctl enable mongod
+systemctl restart mongod
+
+# Wait for the daemon to accept connections.
+for i in $(seq 1 30); do
+  if mongo --quiet --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null 2>&1; then break; fi
+  sleep 3
+done
+
+###############################################################################
+# Create users, then turn authentication on (exercise requires DB auth)
+###############################################################################
+mongo admin --quiet --eval "db.createUser({user: '${admin_user}', pwd: '${admin_password}', roles: [{role: 'root', db: 'admin'}]})" || true
+mongo ${app_database} --quiet --eval "db.createUser({user: '${app_user}', pwd: '${app_password}', roles: [{role: 'readWrite', db: '${app_database}'}]})" || true
+
+# Seed a starter document so the app has something to render immediately.
+mongo ${app_database} --quiet --eval "db.todos.insertOne({title: 'Validate wizexercise.txt inside the running pod', done: false, createdAt: new Date()})" || true
+
+cat >> /etc/mongod.conf <<'MONGOAUTH'
+security:
+  authorization: enabled
+MONGOAUTH
+
+systemctl restart mongod
+sleep 10
+
+###############################################################################
+# Daily backup to the (publicly readable) S3 bucket
+###############################################################################
+cat > /usr/local/bin/mongo-backup.sh <<'BACKUP'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUCKET="__BUCKET__"
+REGION="__REGION__"
+DB="__DB__"
+USER="__USER__"
+PASS="__PASS__"
+
+STAMP=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+WORKDIR=$(mktemp -d)
+ARCHIVE="/tmp/mongo-$DB-$STAMP.gz"
+
+trap 'rm -rf "$WORKDIR" "$ARCHIVE"' EXIT
+
+mongodump \
+  --host 127.0.0.1 \
+  --port 27017 \
+  --username "$USER" \
+  --password "$PASS" \
+  --authenticationDatabase "$DB" \
+  --db "$DB" \
+  --archive="$ARCHIVE" \
+  --gzip
+
+aws s3 cp "$ARCHIVE" "s3://$BUCKET/backups/$DB/$STAMP.gz" --region "$REGION"
+
+logger -t mongo-backup "uploaded s3://$BUCKET/backups/$DB/$STAMP.gz"
+BACKUP
+
+sed -i "s|__BUCKET__|${backup_bucket}|" /usr/local/bin/mongo-backup.sh
+sed -i "s|__REGION__|${region}|"        /usr/local/bin/mongo-backup.sh
+sed -i "s|__DB__|${app_database}|"      /usr/local/bin/mongo-backup.sh
+sed -i "s|__USER__|${app_user}|"        /usr/local/bin/mongo-backup.sh
+sed -i "s|__PASS__|${app_password}|"    /usr/local/bin/mongo-backup.sh
+
+chmod 700 /usr/local/bin/mongo-backup.sh
+
+# Daily at 02:00 UTC.
+cat > /etc/cron.d/mongo-backup <<'CRON'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 2 * * * root /usr/local/bin/mongo-backup.sh >> /var/log/mongo-backup.log 2>&1
+CRON
+
+chmod 644 /etc/cron.d/mongo-backup
+systemctl enable cron
+systemctl restart cron
+
+# Run once now so there is evidence in the bucket without waiting for 02:00.
+/usr/local/bin/mongo-backup.sh >> /var/log/mongo-backup.log 2>&1 || true
+
+echo "wiz-bootstrap complete"

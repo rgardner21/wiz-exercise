@@ -1,0 +1,17 @@
+{
+  "name": "wiz-todo",
+  "version": "1.0.0",
+  "description": "Containerized todo application backed by a self-managed MongoDB VM",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongodb": "^6.8.0"
+  },
+  "license": "MIT"
+}

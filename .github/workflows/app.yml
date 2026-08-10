@@ -1,0 +1,216 @@
+name: App · build, scan, push, deploy
+
+on:
+  pull_request:
+    paths: ['app/**', 'k8s/**', '.github/workflows/app.yml']
+  push:
+    branches: [main]
+    paths: ['app/**', 'k8s/**', '.github/workflows/app.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EKS_CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+  K8S_NAMESPACE: wiz-todo
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Build the image, prove wizexercise.txt is inside it, then scan it.
+  # Nothing is pushed until all three pass.
+  # --------------------------------------------------------------------------
+  build-and-scan:
+    name: Build and scan image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      image-tar: wiz-todo.tar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if wizexercise.txt is missing or unedited
+        run: |
+          test -f app/wizexercise.txt || { echo "app/wizexercise.txt is missing"; exit 1; }
+          if grep -q 'REPLACE_WITH_YOUR_FULL_NAME' app/wizexercise.txt; then
+            echo "app/wizexercise.txt still holds the placeholder. Put your name in it."
+            exit 1
+          fi
+          echo "wizexercise.txt contents: $(cat app/wizexercise.txt)"
+
+      - name: Secret scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dockerfile misconfiguration scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: app/Dockerfile
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: false
+          load: true
+          tags: wiz-todo:${{ github.sha }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----------------------------------------------------------------------
+      # Exercise evidence: prove the file exists INSIDE the built image,
+      # before it is ever pushed.
+      # ----------------------------------------------------------------------
+      - name: Verify wizexercise.txt inside the image
+        run: |
+          echo "::group::Image layer listing"
+          docker run --rm --entrypoint sh wiz-todo:${{ github.sha }} -c 'ls -l /app/wizexercise.txt'
+          echo "::endgroup::"
+
+          CONTENT=$(docker run --rm --entrypoint sh wiz-todo:${{ github.sha }} -c 'cat /app/wizexercise.txt')
+          echo "wizexercise.txt in image: $CONTENT"
+          test -n "$CONTENT" || { echo "wizexercise.txt is empty inside the image"; exit 1; }
+
+          {
+            echo '### wizexercise.txt verified in image'
+            echo '```'
+            echo "$CONTENT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trivy image scan (blocking)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: wiz-todo:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '1'
+
+      - name: Trivy image scan (SARIF for code scanning)
+        if: always()
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: wiz-todo:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: '0'
+
+      - name: Upload image scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: wiz-todo:${{ github.sha }}
+          format: spdx-json
+          artifact-name: wiz-todo-sbom.spdx.json
+
+      - name: Kubernetes manifest scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: k8s/
+          severity: CRITICAL,HIGH
+          exit-code: '0' # cluster-admin binding is an intentional finding
+
+  # --------------------------------------------------------------------------
+  # Push to ECR and roll out. main branch only, behind the same protected
+  # environment as the IaC apply.
+  # --------------------------------------------------------------------------
+  deploy:
+    name: Push and deploy
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to ECR
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
+
+      - name: Deploy
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}
+        run: |
+          cd k8s
+          kubectl kustomize . | sed "s|PLACEHOLDER_IMAGE:latest|$IMAGE|g" | kubectl apply -f -
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment/wiz-todo --timeout=5m
+
+      # ----------------------------------------------------------------------
+      # Exercise evidence: prove the file exists in the RUNNING container.
+      # ----------------------------------------------------------------------
+      - name: Verify wizexercise.txt in the running pod
+        run: |
+          POD=$(kubectl -n "$K8S_NAMESPACE" get pods -l app.kubernetes.io/name=wiz-todo \
+                  -o jsonpath='{.items[0].metadata.name}')
+          echo "Pod: $POD"
+          kubectl -n "$K8S_NAMESPACE" exec "$POD" -- ls -l /app/wizexercise.txt
+          CONTENT=$(kubectl -n "$K8S_NAMESPACE" exec "$POD" -- cat /app/wizexercise.txt)
+          echo "Contents: $CONTENT"
+
+          {
+            echo '### wizexercise.txt verified in running pod'
+            echo '```'
+            echo "pod: $POD"
+            echo "$CONTENT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report the load balancer address
+        run: |
+          for i in $(seq 1 30); do
+            HOST=$(kubectl -n "$K8S_NAMESPACE" get ingress wiz-todo \
+                     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$HOST" ] && break
+            sleep 10
+          done
+          echo "Application URL: http://$HOST" >> "$GITHUB_STEP_SUMMARY"

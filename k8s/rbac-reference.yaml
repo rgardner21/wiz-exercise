@@ -1,0 +1,21 @@
+# Reference copy of the cluster-admin binding. Terraform is the source of truth
+# (terraform/k8s_bootstrap.tf); this file exists so the intentional finding is
+# visible to anyone reading the manifests or scanning the repo.
+#
+# INTENTIONAL EXERCISE FINDING: an application service account with
+# cluster-admin means container compromise equals cluster compromise.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wiz-todo-cluster-admin
+  labels:
+    exercise.wiz/intentional-finding: cluster-admin-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: wiz-todo
+    namespace: wiz-todo

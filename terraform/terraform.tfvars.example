@@ -1,0 +1,13 @@
+region      = "us-east-1"
+project     = "wizex"
+alert_email = "you@example.com"
+
+# owner/name of the GitHub repo allowed to assume the deploy roles
+github_repository = "rgardner21/wiz-exercise"
+
+# ssh-keygen -t ed25519 -f ~/.ssh/wizex -C wizex, then paste ~/.ssh/wizex.pub here.
+ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
+
+# The exercise calls for 0.0.0.0/0. Narrowing to your own /32 keeps the same
+# "SSH from outside the VPC" finding with far less exposure while you build.
+ssh_ingress_cidr = "0.0.0.0/0"

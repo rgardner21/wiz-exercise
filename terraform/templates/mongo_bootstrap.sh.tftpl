@@ -55,7 +55,10 @@ done
 # Create users, then turn authentication on (exercise requires DB auth)
 ###############################################################################
 mongo admin --quiet --eval "db.createUser({user: '${admin_user}', pwd: '${admin_password}', roles: [{role: 'root', db: 'admin'}]})" || true
-mongo ${app_database} --quiet --eval "db.createUser({user: '${app_user}', pwd: '${app_password}', roles: [{role: 'readWrite', db: '${app_database}'}]})" || true
+# clusterMonitor on admin lets the app read serverStatus, which is how /api/status
+# reports the MongoDB version. Without it the status panel shows "database: error"
+# even though reads and writes work fine.
+mongo ${app_database} --quiet --eval "db.createUser({user: '${app_user}', pwd: '${app_password}', roles: [{role: 'readWrite', db: '${app_database}'}, {role: 'clusterMonitor', db: 'admin'}]})" || true
 
 # Seed a starter document so the app has something to render immediately.
 mongo ${app_database} --quiet --eval "db.todos.insertOne({title: 'Validate wizexercise.txt inside the running pod', done: false, createdAt: new Date()})" || true
